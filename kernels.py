@@ -72,7 +72,14 @@ def sgemm_coalesced(A, B, C, M, N, K):
     and modulo by BLOCKSIZE. 
     Be careful which one indexes the column.
     """
-    # TODO
+    x = cuda.blockIdx.x * BLOCKSIZE + (cuda.threadIdx.x // BLOCKSIZE)
+    y = cuda.blockIdx.y * BLOCKSIZE + (cuda.threadIdx.x % BLOCKSIZE)
+
+    if x < M and y < N:
+        tmp = float32(0.0)
+        for i in range(K):
+            tmp += A[x, i] * B[i, y]
+        C[x, y] = tmp
     return
 
 
@@ -97,7 +104,42 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # TODO
+
+    # lecture note 10 pg. 12
+    As = cuda.shared.array((BM3, BK3), float32)
+    Bs = cuda.shared.array((BK3, BN3), float32)
+
+    tx = cuda.threadIdx.x
+
+    local_row, local_col = tx // BN3, tx % BN3
+
+    row = cuda.blockIdx.x * BM3 + local_row
+    col = cuda.blockIdx.y * BN3 + local_col
+
+    acc = float32(0.0)
+
+    for kt in range(0, K, BK3):
+
+        if row < M and kt + local_col < K:
+            As[local_row, local_col] = A[row, kt + local_col]
+        else:
+            As[local_row, local_col] = float32(0.0)
+
+        if kt + local_row < K and col < N:
+            Bs[local_row, local_col] = B[kt + local_row, col]
+        else:
+            Bs[local_row, local_col] = float32(0.0)
+
+        cuda.syncthreads()
+
+        for dk in range(BK3):
+            acc += As[local_row, dk] * Bs[dk, local_col]
+
+        cuda.syncthreads()
+
+    if row < M and col < N:
+        C[row, col] = acc
+
     return
 
 
@@ -123,7 +165,45 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
+    c_row_block = cuda.blockIdx.x
+    c_col_block = cuda.blockIdx.y
+
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
+
+    tx = cuda.threadIdx.x
+
+    thread_row = tx // BN4
+    thread_col = tx % BN4
+
+    a_row, a_col = tx // BK4, tx % BK4
+    b_row, b_col = tx // BN4, tx % BN4
+
+    per_thread_acc = cuda.local.array(TM4, float32)
+
+    for i in range(TM4):
+        per_thread_acc[i] = float32(0.0)
+
+    for kt in range(0, K, BK4):
+        As[a_row, a_col] = A[c_row_block*BM4 + a_row, kt + a_col]
+        Bs[b_row, b_col] = B[kt + b_row, c_col_block*BN4 + b_col] 
+
+        cuda.syncthreads()
+
+        for dk in range(BK4):
+            b_val = Bs[dk, thread_col]
+            for m in range(TM4):
+                per_thread_acc[m] += As[thread_row*TM4 + m, dk] * b_val
+
+        cuda.syncthreads()
+
+    for m in range(TM4):
+        c_row = c_row_block*BM4 + thread_row*TM4 + m
+        c_col = c_col_block*BN4 + thread_col
+
+        if c_row < M and c_col < N:
+            C[c_row, c_col] = per_thread_acc[m]
+
     return
 
 
@@ -148,7 +228,73 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # TODO
+    
+    As = cuda.shared.array((BM5, BK5), float32)
+    Bs = cuda.shared.array((BK5, BN5), float32)
+
+    acc = cuda.local.array((TM5, TN5), float32)
+
+    tx = cuda.threadIdx.x
+
+    thread_row = tx // (BN5 // TN5)
+    thread_col = tx %  (BN5 // TN5)
+
+    c_col_block = cuda.blockIdx.x
+    c_row_block = cuda.blockIdx.y
+
+    for m in range(TM5):
+        for n in range(TN5):
+            acc[m, n] = float32(0.0)
+
+    for kt in range(0, K, BK5):
+
+        # cooperative load of As
+        for load_idx in range(tx, BM5 * BK5, cuda.blockDim.x):#cooperative load of As?
+            a_row = load_idx // BK5 
+            a_col = load_idx % BK5
+
+            global_a_row = c_row_block * BM5 + a_row
+            global_a_col = kt + a_col
+
+            if global_a_row < M and global_a_col < K:
+                As[a_row, a_col] = A[global_a_row, global_a_col]
+            else:
+                As[a_row, a_col] = float32(0.0)
+
+        for load_idx in range(tx, BK5 * BN5, cuda.blockDim.x): # then that would make this coop-load of Bs
+
+            b_row = load_idx // BN5
+            b_col = load_idx % BN5
+
+            global_b_row = kt + b_row
+            global_b_col = c_col_block * BN5 + b_col
+
+            if global_b_row < K and global_b_col < N:
+                Bs[b_row, b_col] = B[global_b_row, global_b_col]
+            else:
+                Bs[b_row, b_col] = float32(0.0)
+
+        cuda.syncthreads()
+
+        for dk in range(BK5):
+            for m in range(TM5):
+                a_val = As[thread_row * TM5 + m, dk]
+
+                for n in range(TN5):
+                    b_val = Bs[dk, thread_col * TN5 + n]
+                    acc[m, n] += a_val * b_val
+
+        cuda.syncthreads()
+    
+    for m in range(TM5):
+        for n in range(TN5):
+            c_row = c_row_block * BM5 + thread_row * TM5 + m
+            c_col = c_col_block * BN5 + thread_col * TN5 + n
+
+            if c_row < M and c_col < N:
+                C[c_row, c_col] = acc[m, n]
+    # should I have this many fucking for-loops? NOTE: it matches Siboehm's for-loops but is the difference CUDA vs. Numba somewhow?
+
     return
 
 
