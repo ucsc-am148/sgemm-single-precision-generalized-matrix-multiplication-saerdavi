@@ -165,8 +165,8 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    c_row_block = cuda.blockIdx.x
-    c_col_block = cuda.blockIdx.y
+    c_row_block = cuda.blockIdx.y
+    c_col_block = cuda.blockIdx.x
 
     As = cuda.shared.array((BM4, BK4), float32)
     Bs = cuda.shared.array((BK4, BN4), float32)
@@ -176,8 +176,13 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     thread_row = tx // BN4
     thread_col = tx % BN4
 
-    a_row, a_col = tx // BK4, tx % BK4
-    b_row, b_col = tx // BN4, tx % BN4
+    a_row =  tx // BK4
+    a_col = tx % BK4
+
+    
+    b_row = tx // BN4
+    b_col = tx % BN4
+
 
     per_thread_acc = cuda.local.array(TM4, float32)
 
@@ -185,15 +190,21 @@ def sgemm_1d_tile(A, B, C, M, N, K):
         per_thread_acc[i] = float32(0.0)
 
     for kt in range(0, K, BK4):
-        As[a_row, a_col] = A[c_row_block*BM4 + a_row, kt + a_col]
-        Bs[b_row, b_col] = B[kt + b_row, c_col_block*BN4 + b_col] 
+        
+        ga_row = c_row_block * BM4 + a_row
+        ga_col = kt + a_col
+        As[a_row, a_col] = A[ga_row, ga_col] if ga_row < M and ga_col < K else float32(0.0)
+
+        gb_row = kt + b_row
+        gb_col = c_col_block * BN4 + b_col
+        Bs[b_row, b_col] = B[gb_row, gb_col] if gb_row < K and gb_col < N else float32(0.0)
 
         cuda.syncthreads()
 
         for dk in range(BK4):
             b_val = Bs[dk, thread_col]
             for m in range(TM4):
-                per_thread_acc[m] += As[thread_row*TM4 + m, dk] * b_val
+                per_thread_acc[m] += As[thread_row * TM4 + m, dk] * b_val
 
         cuda.syncthreads()
 
