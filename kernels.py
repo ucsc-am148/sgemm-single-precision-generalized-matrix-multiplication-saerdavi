@@ -252,9 +252,7 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
     c_col_block = cuda.blockIdx.x
     c_row_block = cuda.blockIdx.y
-
-    a_reg = cuda.local.array(TM5, float32)
-    b_reg = cuda.local.array(TN5, float32)
+ 
 
     for m in range(TM5):
         for n in range(TN5):
@@ -293,14 +291,11 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     
         for dk in range(BK5):
             for m in range(TM5):
-                a_reg[m] = As[thread_row * TM5 + m, dk]
+                a_val = As[thread_row * TM5 + m, dk]
 
-            for n in range(TN5):
-                b_reg[n] = Bs[dk, thread_col * TN5 + n]
-
-            for m in range(TM5):
                 for n in range(TN5):
-                    acc[m, n] += a_reg[m] * b_reg[n]
+                    b_val = Bs[dk, thread_col * TN5 + n]
+                    acc[m, n] += a_val * b_val
 
         cuda.syncthreads()
     
